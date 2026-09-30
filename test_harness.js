@@ -43,9 +43,12 @@ function makeClient(name, uid, groupIds) {
         getServerGroups() {
             return this._groups.map(function(g) { return { id: function() { return String(g); } }; });
         },
-        // Only channel() exists on the real SinusBot TS3 backend — do NOT add chan(),
-        // or an accessor typo in the plugin can never be caught here.
-        channel() { return this._channel; },
+        // Deliberately NO channel()/chan() accessor: the live SinusBot Client
+        // object has none (verified against a running 1.0.2 instance). Modelling
+        // one here would hide any plugin code that depends on it.
+        equals(other) {
+            return !!other && String(other.uid()) === String(this.uid());
+        },
         chat(text) { this.chats.push(String(text)); },
         moveTo(target) {
             const ch = typeof target === 'object' && target ? target : world.channelById(target);
@@ -72,6 +75,8 @@ function makeChannel(worldRef, id, name, opts) {
         id() { return this._id; },
         name() { return this._name; },
         description() { return this._description; },
+        // The live API spells this getClients(), not clients().
+        getClients() { return worldRef.occupants(this._id); },
         setDescription(d) {
             if (this._deleted) throw new Error('channel deleted');
             if (String(d).length > 8000) throw new Error('description too long for the server');
@@ -136,7 +141,11 @@ const world = {
     },
     isConnected() { return true; },
     occupants(channelId) {
-        return this.clients.filter(function(c) { return c._channelId === String(channelId); });
+        // The bot IS an occupant like any other client, and Channel.getClients()
+        // includes it — omitting it here hides every "move the bot out first" bug.
+        const everyone = this.clients.slice();
+        if (this._self) everyone.push(this._self);
+        return everyone.filter(function(c) { return c._channelId === String(channelId); });
     },
     fireMove(client, fromId, toChannel) {
         const handlers = this.handlers['clientMove'] || [];
@@ -165,6 +174,7 @@ function run(label, setup) {
     // persisted state at load time, so a later assignment never reaches it.
     const storeData = Object.assign({}, (setup && setup.seedStore) || {});
     const logs = [];
+    const sandboxIntervals = [];
 
     function sandboxRequire(name) {
         if (name === 'engine') {
@@ -196,8 +206,13 @@ function run(label, setup) {
         },
         require: sandboxRequire,
         console: console,
+        // Keep the REAL setTimeout/setInterval: stubbing the interval timer means the
+    // periodic reconciler never runs and every maintenance test passes vacuously.
         setTimeout: setTimeout,
-        setInterval: function() { return 0; }, // intervals not auto-run in scenarios
+        setInterval: function(fn, ms) {
+            sandboxIntervals.push({ fn: fn, ms: ms });
+            return sandboxIntervals.length;
+        },
         clearInterval: function() {},
         JSON: JSON,
         Date: Date,
@@ -234,6 +249,15 @@ function run(label, setup) {
 
     return {
         seeded: seeded,
+        intervals: sandboxIntervals,
+        // Drive the plugin's periodic maintenance pass on demand, the same way
+        // the live bot's setInterval would.
+        runMaintenance(times) {
+            const n = times || 1;
+            for (let t = 0; t < n; t++) {
+                for (const timer of sandboxIntervals) timer.fn();
+            }
+        },
         chat(text, client, opts) {
             opts = opts || {};
             const ev = {
@@ -808,6 +832,123 @@ function scheduleEvent(h, client, templateIndex, dateText, timeText) {
     scheduleEvent(h, u.alice, 1, '04/10/2026', '20:00');
     check('main board still works', /Raid/.test(h.board()), h.board());
     check('mini board untouched', h.miniBoard() === null || h.miniBoard() === '', String(h.miniBoard()));
+})();
+
+// --- 17. Occupied template channel is never deleted ----------------------
+// Live-stack regression: the SinusBot Client object has no channel accessor,
+// so a plugin that guesses one silently moves nobody out and the delete fails
+// with the author stranded in a leaked channel.
+(function scenarioOccupiedNotDeleted() {
+    const h = run('17. Occupied template channel is not deleted', { config: baseConfig() });
+    const u = seedWorld();
+    say(h, u.alice, '!event');
+    say(h, u.alice, 'new');
+    say(h, u.alice, 'Raid');
+    const ch = world.channelById(world.created[world.created.length - 1].id);
+    ch.setDescription('Raid {date} {time}');
+
+    // A bystander walks into the template channel and refuses to leave
+    // (their moveTo is a no-op, as if the server rejected it).
+    u.bob.moveTo(ch.id());
+    const bobRealMove = u.bob.moveTo;
+    u.bob.moveTo = function() { /* server refuses */ };
+
+    clearChats();
+    say(h, u.alice, 'save template');
+    check('author moved out despite the bystander',
+        u.alice._channelId === '3', u.alice._channelId);
+    check('occupied channel was NOT deleted', !!world.channelById(ch.id()), '');
+    check('the bot was still moved out', world._self._channelId === '3', world._self._channelId);
+
+    // The session is cleared (the template saved), so the channel has to be
+    // tracked separately or it would be orphaned forever.
+    eq('session cleared after save', Object.keys(JSON.parse(h.storeData.eventSessions || '{}')).length, 0);
+    const orphans = JSON.parse(h.storeData.eventOrphanChannels || '{}');
+    check('the stuck channel is recorded as an orphan',
+        Object.keys(orphans).length === 1 && orphans[ch.id()], JSON.stringify(orphans));
+    check('orphan entry remembers the owner', orphans[ch.id()] &&
+        orphans[ch.id()].ownerUid === 'uid_alice', JSON.stringify(orphans));
+
+    // Once the bystander leaves, the maintenance retry deletes it.
+    u.bob.moveTo = bobRealMove;
+    u.bob.moveTo('3');
+    h.runMaintenance();
+    eq('retry deleted the channel once it emptied', !!world.channelById(ch.id()), false);
+    eq('orphan list is empty again',
+        Object.keys(JSON.parse(h.storeData.eventOrphanChannels || '{}')).length, 0);
+    eq('the saved template survived the whole ordeal',
+        JSON.parse(h.storeData.eventTemplates).length, 1);
+})();
+
+// --- 18. Deleting the temp channel requires it to be empty --------------
+(function scenarioDeleteRefusesOccupied() {
+    const h = run('18. Server refuses to delete an occupied channel', { config: baseConfig() });
+    const u = seedWorld();
+    say(h, u.alice, '!event');
+    say(h, u.alice, 'new');
+    say(h, u.alice, 'Raid');
+    const ch = world.channelById(world.created[world.created.length - 1].id);
+    ch.setDescription('Raid {date} {time}');
+
+    // Model the server: even if the bot believes the channel is empty, a
+    // delete that the server rejects must not lose the template.
+    const realDelete = ch.delete;
+    ch.delete = function() { throw new Error('server refused the delete'); };
+
+    clearChats();
+    say(h, u.alice, 'save template');
+    check('a refused delete does not abort the save', /saved/.test(lastChat(u.alice)), lastChat(u.alice));
+    check('channel survives the refusal', !!world.channelById(ch.id()), '');
+    eq('template was still stored', JSON.parse(h.storeData.eventTemplates).length, 1);
+
+    ch.delete = realDelete;
+
+    // A refused delete must be recorded for retry, not silently dropped.
+    const orphans = JSON.parse(h.storeData.eventOrphanChannels || '{}');
+    check('the refused channel is queued for retry', Object.keys(orphans).length === 1,
+        JSON.stringify(orphans));
+    h.runMaintenance();
+    eq('retry deletes it once the server accepts', !!world.channelById(ch.id()), false);
+    eq('orphan queue drained',
+        Object.keys(JSON.parse(h.storeData.eventOrphanChannels || '{}')).length, 0);
+})();
+
+// --- 19. delete() is never called on an occupied channel ----------------
+// Assert the API CALL, not just the outcome: the server rejecting a delete
+// looks identical in a mock to a delete that was correctly never attempted.
+(function scenarioNeverCallsDeleteWhenOccupied() {
+    const h = run('19. delete() not attempted while occupied', { config: baseConfig() });
+    const u = seedWorld();
+    say(h, u.alice, '!event');
+    say(h, u.alice, 'new');
+    say(h, u.alice, 'Raid');
+    const ch = world.channelById(world.created[world.created.length - 1].id);
+    ch.setDescription('Raid {date} {time}');
+
+    let deleteCalls = 0;
+    ch.delete = function() {
+        deleteCalls++;
+        ch._deleted = true;
+        delete world.channels[ch.id()];
+    };
+
+    u.bob.moveTo(ch.id());
+    const bobRealMove = u.bob.moveTo;
+    u.bob.moveTo = function() { /* server refuses */ };
+
+    clearChats();
+    say(h, u.alice, 'save template');
+    eq('delete() was NOT called while the bystander was inside', deleteCalls, 0);
+    check('channel still exists', !!world.channelById(ch.id()), '');
+
+    h.runMaintenance();
+    eq('still not called while occupied', deleteCalls, 0);
+
+    u.bob.moveTo = bobRealMove;
+    u.bob.moveTo('3');
+    h.runMaintenance();
+    eq('called exactly once after the channel emptied', deleteCalls, 1);
+    eq('and the channel is gone', !!world.channelById(ch.id()), false);
 })();
 
 // ---------------------------------------------------------------- summary

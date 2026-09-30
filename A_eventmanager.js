@@ -60,6 +60,7 @@ registerPlugin({
     var templates = [];  // {id, name, ownerUid, ownerName, text, createdAt}
     var events = [];     // {id, templateId, templateName, text, startMs, ownerUid, ownerName, createdAt}
     var sessions = {};   // uid -> session object (survives a bot restart)
+    var orphanChannels = {}; // channelId -> orphaned template channel awaiting deletion
     var nextTemplateId = 1;
     var nextEventId = 1;
     var persistenceInitialized = false;
@@ -497,17 +498,37 @@ registerPlugin({
         return null;
     }
 
-    function channelIdOf(client) {
-        if (!client) return '';
-        try {
-            var channel = null;
-            if (typeof client.channel === 'function') channel = client.channel();
-            else if (typeof client.chan === 'function') channel = client.chan();
-            if (channel && typeof channel.id === 'function') return String(channel.id());
-        } catch (e) {
-            logMessage('WARNING: could not read a client channel: ' + e.message, 2);
+    // The SinusBot Client object exposes NO channel accessor (verified live against
+    // 0.9.x/1.0.2: there is no client.channel(), client.chan() or clientId).
+    // Occupancy must therefore come from the channel side: Channel.getClients().
+    function occupantsOf(channel) {
+        if (!channel || typeof channel.getClients !== 'function') {
+            return [];
         }
-        return '';
+        try {
+            var list = channel.getClients();
+            return Array.isArray(list) ? list : [];
+        } catch (e) {
+            logMessage('WARNING: could not read channel occupants: ' + e.message, 2);
+            return [];
+        }
+    }
+
+    function moveClientOutOf(channel, client, targetId) {
+        if (!client || !targetId) return false;
+        var occupants = occupantsOf(channel);
+        for (var i = 0; i < occupants.length; i++) {
+            if (typeof occupants[i].equals === 'function' && occupants[i].equals(client)) {
+                try {
+                    client.moveTo(targetId);
+                    return true;
+                } catch (e) {
+                    logMessage('WARNING: could not move a client out of the template channel: ' + e.message, 2);
+                    return false;
+                }
+            }
+        }
+        return false;
     }
 
     // A channel can only be deleted while it is empty, so both the author and
@@ -516,33 +537,115 @@ registerPlugin({
         if (!session || !session.channelId) return;
         var channel = backend.getChannelByID(session.channelId);
         if (!channel) {
-            return; // already gone — the caller treats that as a cancel
+            clearOrphanChannel(session.channelId); // already gone server-side
+            return;
         }
         var targetId = stickyChannelId || parentChannelIdForTemplates();
 
         var author = clientByUid(session.ownerUid);
-        if (author && channelIdOf(author) === String(session.channelId) && targetId) {
-            try {
-                author.moveTo(targetId);
-            } catch (e) {
-                logMessage('WARNING: could not move the author out of the template channel: ' + e.message, 2);
-            }
-        }
+        moveClientOutOf(channel, author, targetId);
 
         try {
-            var botChannel = channelIdOf(backend.getBotClient());
-            if (botChannel === String(session.channelId) && targetId) {
-                backend.getBotClient().moveTo(targetId);
-            }
+            moveClientOutOf(channel, backend.getBotClient(), targetId);
         } catch (e) {
             logMessage('WARNING: could not move bot to sticky channel: ' + e.message, 2);
         }
 
+        // Never delete a channel that is still occupied: a failed delete would
+        // leave a stray channel behind with the author stranded in it. Record it
+        // so the maintenance pass retries once the channel empties, instead of
+        // orphaning it with its session already cleared.
+        var stillOccupied = occupantsOf(channel);
+        if (stillOccupied.length > 0) {
+            rememberOrphanChannel(session);
+            logMessage('Template channel ' + session.channelId + ' still holds ' +
+                stillOccupied.length + ' client(s) — not deleting yet. Will retry when it empties.', 2);
+            return;
+        }
+
         try {
             channel.delete();
+            clearOrphanChannel(session.channelId);
             logMessage('Deleted template channel ' + session.channelId + '.', 3);
         } catch (e) {
-            logMessage('ERROR deleting template channel (is it empty?): ' + e.message, 1);
+            rememberOrphanChannel(session);
+            logMessage('ERROR deleting template channel (' + e.message +
+                ') — will retry on the next maintenance pass.', 1);
+        }
+    }
+
+    // Orphaned template channels outlive the session that created them (the
+    // session is cleared on save/cancel), so they are tracked separately.
+    function rememberOrphanChannel(session) {
+        if (!session || !session.channelId) return;
+        orphanChannels[String(session.channelId)] = {
+            channelId: String(session.channelId),
+            ownerUid: String(session.ownerUid || ''),
+            ownerName: String(session.ownerName || ''),
+            since: Date.now()
+        };
+        if (persistenceInitialized) saveData();
+    }
+
+    function clearOrphanChannel(channelId) {
+        var key = String(channelId);
+        if (orphanChannels[key]) {
+            delete orphanChannels[key];
+            if (persistenceInitialized) saveData();
+        }
+    }
+
+    // Retried on every maintenance tick; only reports when something changes so
+    // a permanently stuck channel does not flood the log once a minute.
+    var lastOrphanReport = '';
+    function retryOrphanChannels() {
+        var targetId = stickyChannelId || parentChannelIdForTemplates();
+        var changed = false;
+        for (var key in orphanChannels) {
+            if (!orphanChannels.hasOwnProperty(key)) continue;
+            var entry = orphanChannels[key];
+            var channel = backend.getChannelByID(entry.channelId);
+            if (!channel) {
+                delete orphanChannels[key];
+                changed = true;
+                continue;
+            }
+            var occupants = occupantsOf(channel);
+            if (!occupants.length) {
+                try {
+                    channel.delete();
+                    logMessage('Cleaned up orphaned template channel ' + entry.channelId + '.', 3);
+                    delete orphanChannels[key];
+                    changed = true;
+                    continue;
+                } catch (e) {
+                    logMessage('ERROR cleaning up orphaned channel ' + entry.channelId + ': ' + e.message, 1);
+                    continue;
+                }
+            }
+            // Try once more to move the owner out, in case they were the blocker.
+            moveClientOutOf(channel, clientByUid(entry.ownerUid), targetId);
+            if (occupantsOf(channel).length) {
+            } else {
+                try {
+                    channel.delete();
+                    logMessage('Cleaned up orphaned template channel ' + entry.channelId + ' after its owner left.', 3);
+                    delete orphanChannels[key];
+                    changed = true;
+                } catch (e) {
+                    logMessage('ERROR cleaning up orphaned channel ' + entry.channelId + ': ' + e.message, 1);
+                }
+            }
+        }
+        if (persistenceInitialized && changed) {
+            saveData();
+        }
+        var report = 'orphaned template channels: ' + Object.keys(orphanChannels).length;
+        if (report !== lastOrphanReport) {
+            if (Object.keys(orphanChannels).length > 0) {
+                logMessage('Still waiting to delete ' + report, 2);
+            }
+            lastOrphanReport = report;
         }
     }
 
@@ -622,6 +725,7 @@ registerPlugin({
             store.set('eventTemplates', JSON.stringify(templates));
             store.set('eventEntries', JSON.stringify(events));
             store.set('eventSessions', JSON.stringify(sessions));
+            store.set('eventOrphanChannels', JSON.stringify(orphanChannels));
             store.set('eventCounters', JSON.stringify({ template: nextTemplateId, event: nextEventId }));
         } catch (e) {
             logMessage('ERROR saving data: ' + e.message, 1);
@@ -670,6 +774,21 @@ registerPlugin({
                     }
                 }
                 sessions = loadedSessions;
+            }
+            var rawOrphans = store.get('eventOrphanChannels');
+            if (rawOrphans) {
+                var parsedOrphans = JSON.parse(rawOrphans);
+                var loadedOrphans = {};
+                if (parsedOrphans && typeof parsedOrphans === 'object') {
+                    for (var orphanId in parsedOrphans) {
+                        if (!parsedOrphans.hasOwnProperty(orphanId)) continue;
+                        var orphan = parsedOrphans[orphanId];
+                        if (orphan && orphan.channelId) {
+                            loadedOrphans[String(orphan.channelId)] = orphan;
+                        }
+                    }
+                }
+                orphanChannels = loadedOrphans;
             }
             var rawCounters = store.get('eventCounters');
             if (rawCounters) {
@@ -723,6 +842,7 @@ registerPlugin({
         persistenceInitialized = true;
         saveData(); // persist the cleared sessions so the next boot starts clean
         dropExpiredEvents();
+        retryOrphanChannels();
         updateBoard();
         setInterval(maintenance, 60 * 1000);
         logMessage('Ready. ' + templates.length + ' template(s), ' + upcomingEvents().length + ' upcoming event(s).', 3);
@@ -732,6 +852,7 @@ registerPlugin({
         dropExpiredEvents();
         expireSessions();
         reconcileTemplateChannels();
+        retryOrphanChannels();
         updateBoard();
     }
 
