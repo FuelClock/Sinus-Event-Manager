@@ -180,6 +180,7 @@ function run(label, setup) {
     const storeData = Object.assign({}, (setup && setup.seedStore) || {});
     const logs = [];
     const sandboxIntervals = [];
+    const sandboxTimeouts = [];
 
     function sandboxRequire(name) {
         if (name === 'engine') {
@@ -211,9 +212,15 @@ function run(label, setup) {
         },
         require: sandboxRequire,
         console: console,
-        // Keep the REAL setTimeout/setInterval: stubbing the interval timer means the
-    // periodic reconciler never runs and every maintenance test passes vacuously.
-        setTimeout: setTimeout,
+        // setInterval stays captured (driven by runMaintenance) and one-shot
+        // timers (the quick template-channel delete retry) are captured too:
+        // the world is shared between scenarios, so a REAL timer firing late
+        // would mutate the NEXT scenario's channels. Fire them deliberately
+        // with runTimers().
+        setTimeout: function(fn, ms) {
+            sandboxTimeouts.push(fn);
+            return sandboxTimeouts.length;
+        },
         setInterval: function(fn, ms) {
             sandboxIntervals.push({ fn: fn, ms: ms });
             return sandboxIntervals.length;
@@ -255,6 +262,15 @@ function run(label, setup) {
     return {
         seeded: seeded,
         intervals: sandboxIntervals,
+        // Fire the plugin's pending one-shot timers (quick delete retry) —
+        // no wall-clock waiting.
+        runTimers() {
+            const pending = sandboxTimeouts.splice(0);
+            for (const fn of pending) fn();
+        },
+        pendingTimers() {
+            return sandboxTimeouts.length;
+        },
         // Drive the plugin's periodic maintenance pass on demand, the same way
         // the live bot's setInterval would.
         runMaintenance(times) {
@@ -897,8 +913,12 @@ function scheduleEvent(h, client, templateIndex, dateText, timeText, endText) {
     check('the bot was still moved out', world._self._channelId === '3', world._self._channelId);
 
     // The session is cleared (the template saved), so the channel has to be
-    // tracked separately or it would be orphaned forever.
+    // tracked separately or it would be orphaned forever. The quick re-check
+    // fires first and, still occupied, hands over to the orphan queue.
     eq('session cleared after save', Object.keys(JSON.parse(h.storeData.eventSessions || '{}')).length, 0);
+    eq('a quick re-check was scheduled', h.pendingTimers(), 1);
+    h.runTimers();
+    eq('exactly one quick re-check (no timer loop)', h.pendingTimers(), 0);
     const orphans = JSON.parse(h.storeData.eventOrphanChannels || '{}');
     check('the stuck channel is recorded as an orphan',
         Object.keys(orphans).length === 1 && orphans[ch.id()], JSON.stringify(orphans));
@@ -976,6 +996,10 @@ function scheduleEvent(h, client, templateIndex, dateText, timeText, endText) {
     say(h, u.alice, 'save template');
     eq('delete() was NOT called while the bystander was inside', deleteCalls, 0);
     check('channel still exists', !!world.channelById(ch.id()), '');
+
+    // The quick re-check also refuses, so nothing is deleted while occupied.
+    h.runTimers();
+    eq('quick re-check also did not delete while occupied', deleteCalls, 0);
 
     h.runMaintenance();
     eq('still not called while occupied', deleteCalls, 0);
@@ -1087,6 +1111,43 @@ function scheduleEvent(h, client, templateIndex, dateText, timeText, endText) {
     check('shortcut lists the templates', /Which template do you want to edit/.test(lastChat(u2.alice)), lastChat(u2.alice));
     say(h2, u2.alice, '1');
     check('shortcut opened the editor', /You are now editing/.test(lastChat(u2.alice)), lastChat(u2.alice));
+})();
+
+// --- 22. Late-propagated occupancy: quick re-check deletes without maintenance
+// Live behaviour: right after save the bot's moves have not propagated to the
+// channel occupancy list, so the first pass sees a "still occupied" channel.
+// The quick re-check (1.5s) must then delete it WITHOUT waiting for the 60s
+// maintenance pass.
+(function scenarioQuickRetryDeletesAfterPropagation() {
+    const h = run('22. Quick re-check deletes after occupancy propagation', { config: baseConfig() });
+    const u = seedWorld();
+    say(h, u.alice, '!event');
+    say(h, u.alice, 'new');
+    say(h, u.alice, 'Raid');
+    const ch = world.channelById(world.created[world.created.length - 1].id);
+    ch.setDescription('Raid {date} {time}');
+
+    // At save time the author's move-out has not propagated yet: the channel
+    // still reports her, although she is already in the sticky channel.
+    clearChats();
+    const realGetClients = ch.getClients;
+    ch.getClients = function () { return [u.alice]; };
+    say(h, u.alice, 'save template');
+    ch.getClients = realGetClients;
+
+    check('save succeeded despite the stale occupancy', /saved/.test(lastChat(u.alice)), lastChat(u.alice));
+    check('channel still exists right after save', !!world.channelById(ch.id()), '');
+    eq('author is already out', u.alice._channelId, '3');
+    eq('a quick re-check was scheduled', h.pendingTimers(), 1);
+    eq('not queued for the slow maintenance pass yet',
+        Object.keys(JSON.parse(h.storeData.eventOrphanChannels || '{}')).length, 0);
+
+    h.runTimers();
+    eq('quick re-check deleted the emptied channel', !!world.channelById(ch.id()), false);
+    eq('no orphan record needed',
+        Object.keys(JSON.parse(h.storeData.eventOrphanChannels || '{}')).length, 0);
+    eq('template survived', JSON.parse(h.storeData.eventTemplates).length, 1);
+    eq('author parked in the sticky channel', u.alice._channelId, '3');
 })();
 
 // ---------------------------------------------------------------- summary

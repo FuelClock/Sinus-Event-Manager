@@ -501,7 +501,7 @@ registerPlugin({
             description: description,
             parent: parentId,
             permanent: false,
-            deleteDelay: 300
+            deleteDelay: 30
         };
         var created = null;
         try {
@@ -563,9 +563,19 @@ registerPlugin({
 
     // A channel can only be deleted while it is empty, so both the author and
     // the bot are moved out before the delete is attempted.
-    function deleteTemplateChannel(session) {
+    //
+    // Right after save/cancel the just-issued moves have usually not propagated
+    // to the occupancy list yet, so the first pass often sees the channel as
+    // still occupied. Instead of waiting for the next 60s maintenance tick,
+    // re-run this function once on a short timer; if it is STILL occupied then,
+    // fall back to the persisted orphan queue for the maintenance pass.
+    var TEMPLATE_QUICK_RETRY_MS = 1500;
+    var quickRetryScheduled = {}; // channelId -> true
+
+    function deleteTemplateChannel(session, isQuickRetry) {
         if (!session || !session.channelId) return;
         var channel = backend.getChannelByID(session.channelId);
+        delete quickRetryScheduled[String(session.channelId)];
         if (!channel) {
             clearOrphanChannel(session.channelId); // already gone server-side
             return;
@@ -581,15 +591,19 @@ registerPlugin({
             logMessage('WARNING: could not move bot to sticky channel: ' + e.message, 2);
         }
 
-        // Never delete a channel that is still occupied: a failed delete would
-        // leave a stray channel behind with the author stranded in it. Record it
-        // so the maintenance pass retries once the channel empties, instead of
-        // orphaning it with its session already cleared.
         var stillOccupied = occupantsOf(channel);
         if (stillOccupied.length > 0) {
-            rememberOrphanChannel(session);
+            if (isQuickRetry) {
+                // Genuinely still occupied — the maintenance pass takes over.
+                rememberOrphanChannel(session);
+                logMessage('Template channel ' + session.channelId + ' still holds ' +
+                    stillOccupied.length + ' client(s) after the quick re-check — ' +
+                    'will retry on the maintenance pass.', 2);
+                return;
+            }
+            scheduleQuickChannelDelete(session);
             logMessage('Template channel ' + session.channelId + ' still holds ' +
-                stillOccupied.length + ' client(s) — not deleting yet. Will retry when it empties.', 2);
+                stillOccupied.length + ' client(s) — re-checking shortly.', 2);
             return;
         }
 
@@ -602,6 +616,16 @@ registerPlugin({
             logMessage('ERROR deleting template channel (' + e.message +
                 ') — will retry on the next maintenance pass.', 1);
         }
+    }
+
+    function scheduleQuickChannelDelete(session) {
+        if (!session || !session.channelId) return;
+        var key = String(session.channelId);
+        if (quickRetryScheduled[key]) return;
+        quickRetryScheduled[key] = true;
+        setTimeout(function () {
+            deleteTemplateChannel(session, true);
+        }, TEMPLATE_QUICK_RETRY_MS);
     }
 
     // Orphaned template channels outlive the session that created them (the
