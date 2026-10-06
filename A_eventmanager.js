@@ -488,14 +488,17 @@ registerPlugin({
             'Then type "save template" in chat, or "cancel template".';
     }
 
-    function createTemplateChannel(name, ownerName) {
+    function createTemplateChannel(name, ownerName, seedText) {
         var parentId = parentChannelIdForTemplates();
         if (!parentId) {
             return null;
         }
+        var description = (seedText !== undefined)
+            ? String(seedText)
+            : templateChannelDescription(ownerName);
         var params = {
             name: templateChannelName(name),
-            description: templateChannelDescription(ownerName),
+            description: description,
             parent: parentId,
             permanent: false,
             deleteDelay: 300
@@ -977,6 +980,11 @@ registerPlugin({
             return;
         }
 
+        if (sub === 'edit') {
+            startTemplateEditing(invoker, uid);
+            return;
+        }
+
         if (args) {
             invoker.chat('[EventManager] Unknown option "' + args + '". Type !' + botName + ' help.');
             return;
@@ -990,6 +998,7 @@ registerPlugin({
         invoker.chat('[EventManager] EVENT COMMANDS:\n' +
             t + ' - Start planning an event (create a template or use an existing one)\n' +
             t + ' templates - List your templates\n' +
+            t + ' edit - Edit one of your templates (opens a channel pre-filled with it)\n' +
             t + ' delete <n> - Delete one of your templates\n' +
             t + ' remove <n> - Remove board event number <n>\n' +
             t + ' cancel - Cancel the command you are in the middle of\n' +
@@ -1001,6 +1010,7 @@ registerPlugin({
         var mine = templatesOf(uid);
         var prompt = '[EventManager] What do you want to do? Reply with:\n' +
             '  new - create a new event template\n' +
+            '  edit - edit one of your existing templates\n' +
             '  <number> - use one of your existing templates\n' +
             '  !' + botName + ' cancel - abort\n';
         if (mine.length) {
@@ -1108,8 +1118,10 @@ registerPlugin({
             botName + ' cancel to abort.');
     }
 
-    function openTemplateEditor(invoker, uid, name) {
-        var channel = createTemplateChannel(name, invoker.name());
+    function openTemplateEditor(invoker, uid, name, existingTemplate) {
+        var editing = !!existingTemplate;
+        var channel = createTemplateChannel(name, invoker.name(),
+            editing ? existingTemplate.text : undefined);
         if (!channel) {
             clearSession(uid);
             invoker.chat('[EventManager] Could not create a template channel. Check the TEMPLATE_PARENT_CHANNEL_ID / EVENT_CHANNEL_ID setting.');
@@ -1122,7 +1134,10 @@ registerPlugin({
             ownerUid: uid,
             ownerName: invoker.name(),
             templateName: name,
-            channelId: channel.id()
+            channelId: channel.id(),
+            editing: editing,
+            templateId: editing ? existingTemplate.id : 0,
+            seedText: editing ? String(existingTemplate.text) : ''
         });
 
         var granted = grantChannelAdmin(invoker, channel.id());
@@ -1160,11 +1175,16 @@ registerPlugin({
         if (!granted) {
             invoker.chat('[EventManager] Warning: I could not grant you channel admin, so you may not be able to edit the description. Ask an admin to set the channel admin group.');
         }
-        invoker.chat('[EventManager] You are now in "' + channel.name() + '".\n' +
-            'Open the channel information and write your event template into the DESCRIPTION.\n' +
-            'Use {date} and {time} where the date and time go, e.g.:\n' +
-            '[b]Raid[/b] — {date} at {time}\nJoin voice channel 1.\n\n' +
-            'When you are done type "save template" here, or "cancel template" to discard it.');
+        var intro = editing
+            ? '[EventManager] You are now editing "' + channel.name() + '".\n' +
+              'The DESCRIPTION already contains the template — edit it there.\n' +
+              'Keep {date} and {time} where the date and time go.\n\n'
+            : '[EventManager] You are now in "' + channel.name() + '".\n' +
+              'Open the channel information and write your event template into the DESCRIPTION.\n' +
+              'Use {date} and {time} where the date and time go, e.g.:\n' +
+              '[b]Raid[/b] — {date} at {time}\nJoin voice channel 1.\n\n';
+        invoker.chat(intro +
+            'When you are done type "save template" here, or "cancel template" to discard your changes.');
     }
 
     function saveTemplateFromEditor(invoker, uid) {
@@ -1191,16 +1211,53 @@ registerPlugin({
                 'Write your event template in the channel information first, then type "save template".');
             return;
         }
+        // When editing, an unchanged description means nothing was changed —
+        // saving would silently be a no-op.
+        if (session.editing && text.trim() === String(session.seedText || '').trim()) {
+            invoker.chat('[EventManager] You have not changed the description yet — edit the template in the channel information first, then type "save template".');
+            return;
+        }
         if (!text.trim()) {
             invoker.chat('[EventManager] The channel description is still empty — write your template there first, then type "save template".');
             return;
         }
         deleteTemplateChannel(session);
         clearSession(uid);
-        var tpl = saveTemplate(uid, ownerName, name, text);
-        logMessage('Saved template "' + tpl.name + '" for ' + ownerName + '.', 3);
+        var tpl = null;
+        if (session.editing) {
+            tpl = findTemplateById(uid, session.templateId);
+        }
+        if (tpl) {
+            tpl.text = text;
+            tpl.updatedAt = new Date().toISOString();
+            if (persistenceInitialized) saveData();
+        } else {
+            tpl = saveTemplate(uid, ownerName, name, text);
+        }
+        logMessage('Saved template "' + tpl.name + '" for ' + ownerName +
+            (session.editing ? ' (edited).' : '.') , 3);
         invoker.chat('[EventManager] Template "' + tpl.name + '" saved. Use !' + botName +
             ' and reply with its number to plan an event with it.');
+    }
+
+    function startTemplateEditing(invoker, uid) {
+        var mine = templatesOf(uid);
+        if (!mine.length) {
+            clearSession(uid);
+            invoker.chat('[EventManager] You have no templates. Type !' + botName + ' and reply "new" to create one.');
+            return;
+        }
+        var lines = '[EventManager] Which template do you want to edit? Reply with the number, or !' + botName + ' cancel to abort.\n';
+        for (var i = 0; i < mine.length; i++) {
+            lines += '  ' + (i + 1) + '. ' + mine[i].name + '\n';
+        }
+        setSession(uid, {
+            stage: 'edit_pick',
+            ownerUid: uid,
+            ownerName: invoker.name(),
+            templateIndex: 0
+        });
+        invoker.chat(lines);
     }
 
     function askTemplateSelection(invoker, uid) {
@@ -1330,6 +1387,10 @@ registerPlugin({
                 startTemplateCreation(ev.client, uid);
                 return;
             }
+            if (equalsIgnoreCase(text, 'edit')) {
+                startTemplateEditing(ev.client, uid);
+                return;
+            }
             var chosen = parseInt(text, 10);
             var mine = templatesOf(uid);
             if (!isNaN(chosen) && chosen >= 1 && chosen <= mine.length) {
@@ -1337,7 +1398,7 @@ registerPlugin({
                 askDate(ev.client, uid, template);
                 return;
             }
-            ev.client.chat('[EventManager] Reply with "new", the number of a template, or !' + botName + ' cancel.');
+            ev.client.chat('[EventManager] Reply with "new", "edit", the number of a template, or !' + botName + ' cancel.');
             return;
         }
 
@@ -1359,6 +1420,17 @@ registerPlugin({
 
         if (session.stage === 'template_name_overwrite') {
             openTemplateEditor(ev.client, uid, String(text).trim());
+            return;
+        }
+
+        if (session.stage === 'edit_pick') {
+            var editPick = parseInt(text, 10);
+            var editList = templatesOf(uid);
+            if (isNaN(editPick) || editPick < 1 || editPick > editList.length) {
+                ev.client.chat('[EventManager] Reply with the number of a template from the list, or !' + botName + ' cancel.');
+                return;
+            }
+            openTemplateEditor(ev.client, uid, editList[editPick - 1].name, editList[editPick - 1]);
             return;
         }
 

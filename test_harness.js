@@ -1023,6 +1023,72 @@ function scheduleEvent(h, client, templateIndex, dateText, timeText, endText) {
     }
 })();
 
+// --- 21. Editing an existing template pre-fills the editor channel -------
+(function scenarioEditTemplate() {
+    const h = run('21. Edit existing template', { config: baseConfig() });
+    const u = seedWorld();
+
+    createTemplate(h, u.alice, 'Raid', 'Raid {date} at {time} line one');
+    const original = JSON.parse(h.storeData.eventTemplates)[0];
+
+    // Enter the edit flow.
+    clearChats();
+    say(h, u.alice, '!event');
+    say(h, u.alice, 'edit');
+    check('asked which template to edit', /Which template do you want to edit/.test(lastChat(u.alice)), lastChat(u.alice));
+    say(h, u.alice, '1');
+
+    const created = world.created[world.created.length - 1];
+    const ch = world.channelById(created.id);
+    check('editor channel created for editing', !!ch, '');
+    if (ch) {
+        eq('description pre-filled with the template', ch.description(), 'Raid {date} at {time} line one');
+        check('author moved into the editor channel', String(u.alice._channelId) === String(ch.id()),
+            u.alice._channelId + ' vs ' + ch.id());
+        eq('author holds the channel group', String(ch._channelGroups[u.alice.uid()] || ''), '8');
+        check('told the description is pre-filled', /already contains the template/.test(lastChat(u.alice)), lastChat(u.alice));
+
+        // Saving without a change is refused and keeps the session.
+        clearChats();
+        say(h, u.alice, 'save template');
+        check('unchanged description refused', /not changed the description/.test(lastChat(u.alice)), lastChat(u.alice));
+        eq('still exactly one template', JSON.parse(h.storeData.eventTemplates).length, 1);
+
+        // Edit the description and save.
+        ch.setDescription('Raid {date} at {time} line one\nBring potions.');
+        say(h, u.alice, 'save template');
+        check('edited template saved', /saved/.test(lastChat(u.alice)), lastChat(u.alice));
+        const after = JSON.parse(h.storeData.eventTemplates);
+        eq('template count unchanged', after.length, 1);
+        eq('template id unchanged', after[0].id, original.id);
+        eq('template text updated', after[0].text, 'Raid {date} at {time} line one\nBring potions.');
+        eq('editor channel deleted after save', !!world.channelById(ch.id()), false);
+
+        // Cancelling an edit keeps the template untouched.
+        clearChats();
+        say(h, u.alice, '!event');
+        say(h, u.alice, 'edit');
+        say(h, u.alice, '1');
+        const ch2 = world.channelById(world.created[world.created.length - 1].id);
+        check('second editor channel created', !!ch2, '');
+        eq('pre-filled again with the saved text', ch2.description(), 'Raid {date} at {time} line one\nBring potions.');
+        say(h, u.alice, 'cancel template');
+        check('cancel confirmed', /discarded|cancelled/i.test(lastChat(u.alice)), lastChat(u.alice));
+        eq('template survives the cancel', JSON.parse(h.storeData.eventTemplates).length, 1);
+        eq('cancel removed the editor channel', !!world.channelById(ch2.id()), false);
+    }
+
+    // The standalone !event edit shortcut works too.
+    const h2 = run('21b. !event edit shortcut', { config: baseConfig() });
+    const u2 = seedWorld();
+    createTemplate(h2, u2.alice, 'Solo', 'Solo {date}');
+    clearChats();
+    say(h2, u2.alice, '!event edit');
+    check('shortcut lists the templates', /Which template do you want to edit/.test(lastChat(u2.alice)), lastChat(u2.alice));
+    say(h2, u2.alice, '1');
+    check('shortcut opened the editor', /You are now editing/.test(lastChat(u2.alice)), lastChat(u2.alice));
+})();
+
 // ---------------------------------------------------------------- summary
 console.log('\n========================================');
 console.log('passed: ' + passed + '   failed: ' + failed);
