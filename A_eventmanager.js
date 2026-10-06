@@ -205,12 +205,35 @@ registerPlugin({
     }
 
     var WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    var WEEKDAYS_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    var MONTHS_FULL = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+    function ordinalSuffix(day) {
+        if (day % 100 >= 11 && day % 100 <= 13) return 'th';
+        switch (day % 10) {
+            case 1: return 'st';
+            case 2: return 'nd';
+            case 3: return 'rd';
+            default: return 'th';
+        }
+    }
+
+    // e.g. "Wed 30th September"
+    function formatMiniDate(epochMs) {
+        var p = partsFromEpochMs(epochMs);
+        return WEEKDAYS_SHORT[p.weekday] + ' ' + p.day + ordinalSuffix(p.day) + ' ' + MONTHS_FULL[p.month - 1];
+    }
 
     function formatBoardStamp(epochMs) {
         var p = partsFromEpochMs(epochMs);
         return WEEKDAYS[p.weekday] + ' ' + p.day + ' ' + MONTHS[p.month - 1] + ' ' + p.year +
             ', ' + pad2(p.hour) + ':' + pad2(p.minute);
+    }
+
+    function formatTimeOnly(epochMs) {
+        var p = partsFromEpochMs(epochMs);
+        return pad2(p.hour) + ':' + pad2(p.minute);
     }
 
     function formatDatePlaceholder(epochMs) {
@@ -299,7 +322,7 @@ registerPlugin({
         var list = upcomingEvents(now);
         var board = '';
         if (!list.length) {
-            board = '[center]No upcoming events.[/center]';
+            board = 'No upcoming events.';
         } else {
             var shown = list.slice(0, maxBoardEvents);
             for (var i = 0; i < shown.length; i++) {
@@ -312,8 +335,8 @@ registerPlugin({
                     listName + ' in chat for the full list.';
             }
         }
-        var header = '[center][b][color=#FFD700]' + boardTitle + '[/color][/b][/center]\n' +
-            '[center]Scheduled with !' + botName + '[/center]';
+        var header = '[b][color=#FFD700]' + boardTitle + '[/color][/b]\n' +
+            'Scheduled with !' + botName;
         return header + '\n\n' + board;
     }
 
@@ -349,20 +372,24 @@ registerPlugin({
         var list = upcomingEvents(Date.now());
         var lines = '';
         if (!list.length) {
-            lines = '[center]No upcoming events.[/center]';
+            lines = 'No upcoming events.';
         } else {
             var shown = list.slice(0, maxBoardEvents);
             for (var i = 0; i < shown.length; i++) {
                 var ev = shown[i];
-                lines += '[b]Event:[/b] ' + ev.templateName + '\n' +
-                    '[b]Date:[/b] ' + formatTimePlaceholder(ev.startMs) + ' ' + formatDatePlaceholder(ev.startMs) + '\n' +
+                var timeText = formatTimeOnly(ev.startMs);
+                if (ev.endMs && ev.endMs > ev.startMs) {
+                    timeText += ' - ' + formatTimeOnly(ev.endMs);
+                }
+                lines += '[b]Date:[/b] ' + formatMiniDate(ev.startMs) + ' ' + timeText + '\n' +
+                    '[b]Description:[/b] ' + ev.templateName + '\n' +
                     '[b]Host:[/b] ' + ev.ownerName + '\n\n';
             }
             if (list.length > shown.length) {
                 lines += '... and ' + (list.length - shown.length) + ' more event(s).';
             }
         }
-        return '[center][b][color=#FFD700]' + miniBoardTitle + '[/color][/b][/center]\n\n' + lines;
+        return '[b]' + miniBoardTitle + '[/b]\n\n' + lines;
     }
 
     // ===== TEMPLATES =====
@@ -1195,7 +1222,22 @@ registerPlugin({
             'Reply with the time, or !' + botName + ' cancel to abort.');
     }
 
-    function publishEvent(invoker, uid, template, startMs) {
+    function askEndTime(invoker, uid, template, date, time) {
+        setSession(uid, {
+            stage: 'ask_end',
+            ownerUid: uid,
+            ownerName: invoker.name(),
+            templateId: template.id,
+            templateName: template.name,
+            date: date,
+            time: time
+        });
+        invoker.chat('[EventManager] When does "' + template.name + '" end? (24 hour clock)\n' +
+            'Format: HH:MM — for example 22:00. This is shown on the mini board.\n' +
+            'Reply with the end time, "none" to skip it, or !' + botName + ' cancel to abort.');
+    }
+
+    function publishEvent(invoker, uid, template, startMs, endMs) {
         var entry = {
             id: nextEventId++,
             templateId: template.id,
@@ -1206,6 +1248,9 @@ registerPlugin({
             ownerName: invoker.name(),
             createdAt: new Date().toISOString()
         };
+        if (endMs && endMs > startMs) {
+            entry.endMs = endMs;
+        }
         events.push(entry);
         if (persistenceInitialized) saveData();
         updateBoard();
@@ -1328,10 +1373,31 @@ registerPlugin({
                 ev.client.chat('[EventManager] That template no longer exists. Start again with !' + botName + '.');
                 return;
             }
-            var date = session.date;
-            var startMs = epochFromWallClock(date.year, date.month, date.day, parsedTime.hour, parsedTime.minute);
+            askEndTime(ev.client, uid, timeTemplate, session.date, parsedTime);
+            return;
+        }
+
+        if (session.stage === 'ask_end') {
+            var endMs = null;
+            if (!equalsIgnoreCase(text, 'none') && !equalsIgnoreCase(text, 'no')) {
+                var parsedEnd = parseTimeInput(text);
+                if (!parsedEnd) {
+                    ev.client.chat('[EventManager] I could not read that end time. Use HH:MM in 24 hour format, for example 22:00, or "none" to skip.');
+                    return;
+                }
+                endMs = epochFromWallClock(session.date.year, session.date.month, session.date.day, parsedEnd.hour, parsedEnd.minute);
+            }
+            var endTemplate = findTemplateById(uid, session.templateId);
+            if (!endTemplate) {
+                clearSession(uid);
+                ev.client.chat('[EventManager] That template no longer exists. Start again with !' + botName + '.');
+                return;
+            }
+            var endDate = session.date;
+            var startTime = session.time;
+            var startMs = epochFromWallClock(endDate.year, endDate.month, endDate.day, startTime.hour, startTime.minute);
             clearSession(uid);
-            publishEvent(ev.client, uid, timeTemplate, startMs);
+            publishEvent(ev.client, uid, endTemplate, startMs, endMs);
             return;
         }
     });

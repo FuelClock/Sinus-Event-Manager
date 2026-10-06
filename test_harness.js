@@ -9,6 +9,11 @@ const path = require('path');
 const SRC = process.env.EVENT_SRC || path.join(__dirname, 'A_eventmanager.js');
 const source = fs.readFileSync(SRC, 'utf8');
 
+// Freeze the clock so date-based scenarios never go stale as real time moves
+// on (scheduled dates would otherwise fall into the 6h auto-clear window).
+const FROZEN_NOW = Date.UTC(2026, 9, 1, 12, 0, 0); // Thu 01 Oct 2026 12:00 UTC
+Date.now = function() { return FROZEN_NOW; };
+
 let passed = 0;
 let failed = 0;
 const failures = [];
@@ -355,11 +360,12 @@ function createTemplate(h, client, name, description) {
     return ch;
 }
 
-function scheduleEvent(h, client, templateIndex, dateText, timeText) {
+function scheduleEvent(h, client, templateIndex, dateText, timeText, endText) {
     say(h, client, '!event');
     say(h, client, String(templateIndex));
     if (dateText !== null) say(h, client, dateText);
     if (timeText !== null) say(h, client, timeText);
+    if (timeText !== null) say(h, client, endText || 'none');
 }
 
 // ================================================================ SCENARIOS
@@ -643,8 +649,37 @@ function scheduleEvent(h, client, templateIndex, dateText, timeText) {
     check('12h time rejected', /could not read that time/i.test(lastChat(u.alice)), lastChat(u.alice));
     clearChats();
     say(h, u.alice, '08:30');
+    check('end time prompt shown', /When does "Raid Night" end/.test(lastChat(u.alice)), lastChat(u.alice));
+    clearChats();
+    say(h, u.alice, '12:00');
     check('valid time accepted', /scheduled for Sunday 4 Oct 2026, 08:30/.test(lastChat(u.alice)), lastChat(u.alice));
     check('board has the morning time', /08:30/.test(h.board()), h.board());
+})();
+
+// --- 9b. End time (mini board range) --------------------------------------
+(function scenarioEndTime() {
+    const h = run('9b. End time on the mini board', { config: baseConfig() });
+    const u = seedWorld();
+    createTemplate(h, u.alice, 'Raid Night', 'Starts {date} at {time}');
+
+    scheduleEvent(h, u.alice, 1, '04/10/2026', '20:00', '22:00');
+    const mini = h.miniBoard();
+    check('end prompt is skippable — event scheduled',
+        /scheduled for Sunday 4 Oct 2026, 20:00/.test(lastChat(u.alice)), lastChat(u.alice));
+    check('mini board shows start-end range', /\[b\]Date:\[\/b\] Sun 4th October 20:00 - 22:00/.test(mini), mini);
+
+    scheduleEvent(h, u.alice, 1, '11/10/2026', '20:00', 'none');
+    check('skipped end shows start only',
+        /\[b\]Date:\[\/b\] Sun 11th October 20:00\n/.test(h.miniBoard()), h.miniBoard());
+
+    // end time that is not HH:MM is re-prompted, not published
+    say(h, u.alice, '!event');
+    say(h, u.alice, '1');
+    say(h, u.alice, '12/10/2026');
+    say(h, u.alice, '20:00');
+    clearChats();
+    say(h, u.alice, 'banana');
+    check('bad end time re-prompted', /could not read that end time/i.test(lastChat(u.alice)), lastChat(u.alice));
 })();
 
 // --- 10. Overwriting a same-named template --------------------------------
@@ -776,16 +811,17 @@ function scheduleEvent(h, client, templateIndex, dateText, timeText) {
     scheduleEvent(h, u.alice, 1, '10/10/2026', '20:00');
 
     const mini = h.miniBoard();
-    check('mini board titled', /\[color=#FFD700\]Events/.test(mini), mini);
-    check('mini shows Event label', /\[b\]Event:\[\/b\] Scrims/.test(mini), mini);
-    check('mini shows Date label', /\[b\]Date:\[\/b\] 18:00 04\/10\/2026/.test(mini), mini);
+    check('mini board titled', /\[b\]Events\[\/b\]/.test(mini), mini);
+    check('mini left aligned, no center tags', mini.indexOf('[center]') === -1, mini);
+    check('mini shows Description label', /\[b\]Description:\[\/b\] Scrims/.test(mini), mini);
+    check('mini shows Date label', /\[b\]Date:\[\/b\] Sun 4th October 18:00/.test(mini), mini);
     check('mini shows Host label', /\[b\]Host:\[\/b\] Bob/.test(mini), mini);
     check('mini has no template body', mini.indexOf('Full body text') === -1, mini);
     check('mini sorted soonest first',
         mini.indexOf('Scrims') < mini.indexOf('Raid Night'), mini);
     check('mini shows the second host', /\[b\]Host:\[\/b\] Alice/.test(mini), mini);
     check('mini has two events',
-        (mini.match(/\[b\]Event:\[\/b\]/g) || []).length === 2, mini);
+        (mini.match(/\[b\]Description:\[\/b\]/g) || []).length === 2, mini);
 
     // The full board keeps the bodies; the two boards are independent.
     const full = h.board();
@@ -804,22 +840,22 @@ function scheduleEvent(h, client, templateIndex, dateText, timeText) {
     // not leave it where it was inserted.
     scheduleEvent(h, u.alice, 1, '25/12/2026', '12:00');
     check('later event appended at the bottom of the mini board',
-        h.miniBoard().indexOf('Raid Night') < h.miniBoard().indexOf('25/12/2026'), h.miniBoard());
+        h.miniBoard().indexOf('Raid Night') < h.miniBoard().indexOf('25th December'), h.miniBoard());
     check('later event appended at the bottom of the full board',
         h.board().indexOf('10/10/2026') < h.board().indexOf('25/12/2026'), h.board());
     check('mini board has two events now (one survived the removal, one was just added)',
-        (h.miniBoard().match(/\[b\]Event:\[\/b\]/g) || []).length === 2, h.miniBoard());
+        (h.miniBoard().match(/\[b\]Description:\[\/b\]/g) || []).length === 2, h.miniBoard());
 
     // Insertion order deliberately REVERSED: a late event first, then an
     // early one. Only a real sort puts the early one on top.
     scheduleEvent(h, u.alice, 1, '28/12/2026', '23:00');
     scheduleEvent(h, u.alice, 1, '26/12/2026', '23:00');
     check('reverse-scheduled events still sort soonest-first on the mini board',
-        h.miniBoard().indexOf('26/12/2026') < h.miniBoard().indexOf('28/12/2026'), h.miniBoard());
+        h.miniBoard().indexOf('26th December') < h.miniBoard().indexOf('28th December'), h.miniBoard());
     check('reverse-scheduled events still sort soonest-first on the full board',
         h.board().indexOf('26/12/2026') < h.board().indexOf('28/12/2026'), h.board());
     check('earliest of all four sits at the top of the mini board',
-        h.miniBoard().indexOf('10/10/2026') < h.miniBoard().indexOf('26/12/2026'), h.miniBoard());
+        h.miniBoard().indexOf('10th October') < h.miniBoard().indexOf('26th December'), h.miniBoard());
 })();
 
 // --- 16. Minimal board disabled ------------------------------------------
