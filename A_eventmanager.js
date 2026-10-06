@@ -20,7 +20,7 @@ registerPlugin({
         { name: 'MINI_BOARD_TITLE', title: 'Minimal board title in the description', type: 'string', default: 'Events' },
         { name: 'TEMPLATE_PARENT_CHANNEL_ID', title: 'Parent for temporary template channels (blank = board channel)', type: 'channel' },
         { name: 'STICKY_CHANNEL_ID', title: 'Channel the bot returns to (blank = stay)', type: 'channel' },
-        { name: 'CHANNEL_ADMIN_GROUP', title: 'Channel Group ID granted in template channels', type: 'string', default: '8' },
+        { name: 'CHANNEL_ADMIN_GROUP', title: 'Channel Group ID granted in template channels', type: 'string', default: '5' },
         { name: 'BOARD_TITLE', title: 'Board title in the channel description', type: 'string', default: 'Upcoming Events' },
         { name: 'MAX_BOARD_EVENTS', title: 'Max events shown on the board', type: 'number', default: '20' },
         { name: 'AUTO_CLEAR_HOURS', title: 'Hours after start before an event is removed', type: 'number', default: '6' },
@@ -689,7 +689,15 @@ registerPlugin({
         var channel = backend.getChannelByID(channelId);
         if (!channel) return false;
         try {
-            channel.setChannelGroup(client, group);
+            // Live-verified (Fleet Manager): setChannelGroup can return false
+            // WITHOUT throwing and still have done nothing.
+            var result = channel.setChannelGroup(client, group);
+            if (result === false) {
+                logMessage('ERROR granting channel group ' + channelAdminGroupId +
+                    ' in template channel ' + channelId + ': setChannelGroup returned false (silent refusal).', 1);
+                return false;
+            }
+            logMessage('Granted channel group ' + channelAdminGroupId + ' in template channel ' + channelId + '.', 3);
             return true;
         } catch (e) {
             logMessage('ERROR granting channel admin group: ' + e.message, 1);
@@ -1107,6 +1115,8 @@ registerPlugin({
             invoker.chat('[EventManager] Could not create a template channel. Check the TEMPLATE_PARENT_CHANNEL_ID / EVENT_CHANNEL_ID setting.');
             return;
         }
+        logMessage('Template editor channel ' + channel.id() + ' ("' + channel.name() +
+            '") created for ' + invoker.name() + '.', 3);
         setSession(uid, {
             stage: 'template_edit',
             ownerUid: uid,
@@ -1117,13 +1127,31 @@ registerPlugin({
 
         var granted = grantChannelAdmin(invoker, channel.id());
         try {
-            invoker.moveTo(channel);
+            // The live server rejects a move onto the channel the client is
+            // already in (error 770 "already member of channel"); skip instead.
+            var authorInside = occupantsOf(channel).some(function(c) {
+                return typeof c.equals === 'function' && c.equals(invoker);
+            });
+            if (authorInside) {
+                logMessage('Author ' + invoker.name() + ' is already inside template channel ' +
+                    channel.id() + ' — skipping the move.', 3);
+            } else {
+                invoker.moveTo(channel);
+            }
         } catch (e) {
             logMessage('ERROR moving ' + invoker.name() + ' into template channel: ' + e.message, 1);
         }
         if (stickyChannelId) {
             try {
-                backend.getBotClient().moveTo(channel.id());
+                var botClient = backend.getBotClient();
+                var botInside = occupantsOf(channel).some(function(c) {
+                    return typeof c.equals === 'function' && c.equals(botClient);
+                });
+                if (botInside) {
+                    logMessage('Bot is already inside template channel ' + channel.id() + ' — skipping the follow move.', 3);
+                } else {
+                    botClient.moveTo(channel.id());
+                }
             } catch (e) {
                 logMessage('WARNING: bot could not follow into template channel: ' + e.message, 2);
             }

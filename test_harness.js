@@ -987,6 +987,42 @@ function scheduleEvent(h, client, templateIndex, dateText, timeText, endText) {
     eq('and the channel is gone', !!world.channelById(ch.id()), false);
 })();
 
+// --- 20. Second consecutive template creation still yields an editable channel
+(function scenarioSecondTemplateCreation() {
+    const h = run('20. Second template creation yields an editable channel', { config: baseConfig() });
+    const u = seedWorld();
+
+    // First template, full round trip.
+    createTemplate(h, u.alice, 'Raid', 'Raid {date} at {time}');
+    eq('first template saved', JSON.parse(h.storeData.eventTemplates).length, 1);
+    eq('first template channel deleted', Object.keys(world.channels).filter(function(k) {
+        return /^10[0-9]$/.test(k) && world.channels[k]._name.indexOf('Template:') === 0;
+    }).length, 0);
+
+    // Second template, same user, straight after the save.
+    clearChats();
+    say(h, u.alice, '!event');
+    say(h, u.alice, 'new');
+    say(h, u.alice, 'PvP Night');
+    check('editor opened for the second template', /You are now in/.test(lastChat(u.alice)), lastChat(u.alice));
+    say(h, u.alice, 'PvP Night');
+
+    const created2 = world.created[world.created.length - 1];
+    const ch2 = world.channelById(created2.id);
+    check('second template channel was created', !!ch2, String(world.created.length) + ' creations');
+    if (ch2) {
+        const held = ch2._channelGroups[u.alice.uid()];
+        eq('author holds the granted channel group in the new channel', String(held || ''), '8');
+        check('author was moved into the new channel', String(u.alice._channelId) === String(ch2.id()),
+            u.alice._channelId + ' vs ' + ch2.id());
+        clearChats();
+        ch2.setDescription('PvP {date} {time}');
+        say(h, u.alice, 'save template');
+        check('second template was saved', /saved/.test(lastChat(u.alice)), lastChat(u.alice));
+        eq('two templates stored', JSON.parse(h.storeData.eventTemplates).length, 2);
+    }
+})();
+
 // ---------------------------------------------------------------- summary
 console.log('\n========================================');
 console.log('passed: ' + passed + '   failed: ' + failed);
